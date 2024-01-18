@@ -1,0 +1,26 @@
+# Example 1
+my_test:        hello world!
+
+# Example 2
+my_dictionary:
+    my_key:     hello nested world!
+
+# Example 3 & 4
+my_message:     ${first_word} ${name_to_print}!
+
+# Example 5
+my_key:         key_1
+my_variable_test:
+    key_1:      42
+    key_2:      100
+
+# Example 6
+my_config:
+    my_version: 1.0
+    my_paths:
+        - ${..my_version}/tcy.py
+
+# Definition of fac.n
+fac:
+  $n: $[ ${:n} * ${.$[${:n}-1]} ]
+  1:  1

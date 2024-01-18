@@ -18,6 +18,8 @@ def combine_dicts(*arguments_dicts):
 
 # Converts a string to the value that it would have as when it would be written in yaml
 def string_to_value(value):
+    if value == "*":
+        return value
     return yaml.safe_load(f"v: {value}")["v"]
 
 # Raises an error using the supplied error method
@@ -34,7 +36,7 @@ def raise_error(error_method, error):
 regex_capture_key       = regex.compile(r"\$[^\$]\.*")
 regex_expansion_groups  = regex.compile(r"(?:\$\[(?1)\]|\$\{(?1)\})(?:$^((?>[^$\"'[\]{}]+|\$\$.|\$?(\{(?1)\}|\[(?1)\])|\"[^\"]*\"|'[^']*')*))?")
 regex_path_indirections = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$\$.|\$?(?:\{(?:(?1)|[:.])*\}|\[(?:(?1)|[:.])*\])|\"[^\"]*\"|'[^']*')+)|(?=\.)")
-regex_escape_pattern    = regex.compile(r"\$[^\$]*\$")
+regex_escape_pattern    = regex.compile(r"\$\$(\.)")
 regex_is_regex          = regex.compile(r"^(?!\*$).*[\\+*\.()\[\]{}].*$")
 regex_strip_string      = regex.compile(r"^\s*((?:[^$\"'[\]{}]+?|\$\$.|\$?(?:\{(?:(?1))+\}|\[(?:(?1))+\])|\"[^\"]*\"|'[^']*')*?)\s*$")
 
@@ -50,12 +52,6 @@ class BatchResult:
     @property
     def results(self):
         return [v.data for v in self.accumulators]
-
-# Converts batch results to the list of results
-def collapse_batch_result_to_list(value):
-    if isinstance(value, BatchResult):
-        return [collapse_batch_result_to_list(accumulator.data) for accumulator in value.accumulators]
-    return value
 
 
 # Class to keep track of all evaluations happening.
@@ -74,7 +70,7 @@ class PyamlEngine:
     @property
     def arguments(self):
         return combine_dicts(*self._arguments)
-    def push(self, value, added_location, *new_arguments, **new_keyword_arguments):
+    def push(self, value, added_location="?", *new_arguments, **new_keyword_arguments):
         result = PyamlEngine(None, None)
         result._accumulator = [*self._accumulator, value]
         result._path        = [*self._path, added_location]
@@ -100,6 +96,17 @@ class PyamlEngine:
         result._path        = self._path
         result._arguments   = self._arguments
         return result
+
+    # Converts batch results to the list of results
+    def finalize(self):
+        result              = PyamlEngine(None, None)
+        result._accumulator = self._accumulator
+        if isinstance(result._accumulator[-1], BatchResult):
+            result._accumulator[-1] = [accumulator.finalize().data for accumulator in self.data.accumulators]
+        result._path        = self._path
+        result._arguments   = self._arguments
+        return result
+
 
     # Accesses "attribute"
     def indirect(self, key, error_method=Exception):
@@ -129,7 +136,7 @@ class PyamlEngine:
                     BatchResult([
                         result
                         for i, v in enumerate(self.data)
-                        if (result := self.push(v, str(i), {"__index": i}).indirect(key, None))
+                        if (result := self.push(v, i).indirect(key, None))
                     ])
                     , key
                 )
@@ -139,8 +146,8 @@ class PyamlEngine:
             return self.push(
                 BatchResult([
                     result
-                    for i, accumulator in enumerate(self.data.accumulators)
-                    if (result := accumulator.indirect(key, {"__index": i}), key, None)
+                    for accumulator in self.data.accumulators
+                    if (result := accumulator.indirect(key, None))
                 ])
                 , key
             )
@@ -185,11 +192,7 @@ class PyamlEngine:
                     key_regex       = regex.compile(key)
                     return self.push(
                         BatchResult([
-                            self.push(
-                                v
-                                , k
-                                , match.groupdict() or dict(enumerate(match.groups()))
-                            )
+                            self.push(v, k, match.groupdict() or dict(enumerate(match.groups())))
                             for k, v in self.data.items()
                             if (match := key_regex.match(k))
                         ])
@@ -257,6 +260,9 @@ class PyamlEngine:
             # Handle empty matches, they indicate two subsequent dots -> go up one level
             if key:
 
+                # Replace all escape occurrences
+                key = regex_escape_pattern.sub(lambda m: m.group(1), key)
+
                 # Expand potential variables in this key and do one step of indirection
                 result  = result.indirect(self.expand(False, error_method, value=key), error_method)
 
@@ -277,8 +283,14 @@ class PyamlEngine:
 
             # Handle the dot at the end (resolves to the name of the key we're in)
             elif path == ".":
-                path    = ""
-                result  = result.pop().push(result._path[-1], "__name")
+                if not isinstance(result.data, BatchResult):
+                    result  = result.pop().push(result._path[-1])
+                else:
+                    result = self.push(BatchResult([
+                        accumulator.pop().push(accumulator._path[-1])
+                        for accumulator in result.data.accumulators
+                    ]))
+                break
 
             # Just take away the path separator
             elif path[0] == ".":
@@ -287,7 +299,8 @@ class PyamlEngine:
             else:
                 return raise_error(error_method, f"Invalid path format at '{result.location}': {path}")
 
-        return result
+        # Make sure, batch results are converted to the list of results
+        return result.finalize()
 
 
     # Helper function that expands expressions of the form ${...} int the supplied value
@@ -296,19 +309,22 @@ class PyamlEngine:
         # Determine the value to be expanded (default is the current value of the accumulator)
         if isinstance(value, NotSet):
             value = self.data
+
         result = value
 
         # Is the value a string? -> Expand variables in string
         if isinstance(result, str):
 
+            occurrence_is_whole_string = False
+
             # Called by regex.sub, whenever an expansion group occours
             def expansion_group_callback(pattern):
                 nonlocal result
+                nonlocal occurrence_is_whole_string
 
                 # Determine expansion type
                 if pattern.group().startswith("${"):
                     result = self.resolve(pattern.group()[2:-1].lstrip()).expand(error_method)
-                    result = collapse_batch_result_to_list(result) # Make sure, batch results are converted to the list of results
 
                 elif pattern.group().startswith("$["):
                     expression = self.expand(error_method, value=pattern.group()[2:-1].lstrip())
@@ -317,15 +333,17 @@ class PyamlEngine:
                     except Exception as e:
                         return raise_error(error_method, f"Error while evaluating expression '{expression}': {e}")
 
+                # If this match spans the entire value, use variable "result" to return this value
+                if pattern.span() == (0, len(value)):
+                    occurrence_is_whole_string = True
+                    return ""
 
-                # If the ${...} expression is equal to value (equal to the whole string), return the empty string,
-                # which will lead the call to regex.sub() to return this empty string. Therefore, the assignment
-                # four lines below (result = regex.sub...) will resolve to the "or" case and leav the value of "result"
-                # as it was, after we assigned it in the beginning of this sub-function.
-                # We therefore preserve the datatype of what the ${...} expression resolved to, yay :)
-                return "" if pattern.span() == (0, len(value)) else str(result)
+                return str(result)
 
-            result = regex_expansion_groups.sub(expansion_group_callback, result) or result
+            replacement = regex_expansion_groups.sub(expansion_group_callback, result)
+            if not occurrence_is_whole_string:
+                result = replacement
+
 
         # Otherwise, if nested values shall be expanded, recursively call expand_value on them
         elif expand_nested:

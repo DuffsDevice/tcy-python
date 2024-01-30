@@ -6,7 +6,7 @@ my_dictionary:
     my_key:     hello nested world!
 
 # Example 3 & 4
-my_message:     ${first_word} ${name_to_print}!
+my_message:     "Hello ${name_to_print}!"
 
 # Example 5
 my_key:         key_1
@@ -18,9 +18,18 @@ my_variable_test:
 my_config:
     my_version: 1.0
     my_paths:
-        - ${..my_version}/tcy.py
+        - "${..my_version}/tcy.py"
+
 
 # Definition of fac.n
 fac:
-  $n: $[ ${:n} * ${.$[${:n}-1]} ]
+  $n: $n * ${.$n-1}
   1:  1
+
+my_class:
+  var1: 5
+  var2: 42
+
+my_derived_class:
+  $inherit: ${:my_class.$inherit}
+  var2: 100

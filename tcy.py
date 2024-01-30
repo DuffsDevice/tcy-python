@@ -1,7 +1,11 @@
 import functools
 import regex
 import inspect
-import yaml
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+from ruamel.yaml import YAML
+
+yaml = YAML()
+yaml.preserve_quotes=True
 
 # Magic type to be distict from every other possible value
 class NotSet:
@@ -15,12 +19,14 @@ def combine_dicts(*arguments_dicts):
         , {}
     )
 
-
 # Converts a string to the value that it would have as when it would be written in yaml
 def string_to_value(value):
     if value == "*":
         return value
-    return yaml.safe_load(f"v: {value}")["v"]
+    try:
+        return yaml.load(f"v: {value}", )["v"]
+    except:
+        return value
 
 # Raises an error using the supplied error method
 def raise_error(error_method, error):
@@ -33,16 +39,12 @@ def raise_error(error_method, error):
 
 
 # Regular Expression Constants
-regex_capture_key       = regex.compile(r"\$[^\$]\.*")
-regex_expansion_groups  = regex.compile(r"(?:\$\[(?1)\]|\$\{(?1)\})(?:$^((?>[^$\"'[\]{}]+|\$\$.|\$?(\{(?1)\}|\[(?1)\])|\"[^\"]*\"|'[^']*')*))?")
-regex_path_indirections = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$\$.|\$?(?:\{(?:(?1)|[:.])*\}|\[(?:(?1)|[:.])*\])|\"[^\"]*\"|'[^']*')+)|(?=\.)")
-regex_escape_pattern    = regex.compile(r"\$\$(\.)")
-regex_is_regex          = regex.compile(r"^(?!\*$).*[\\+*\.()\[\]{}].*$")
-regex_strip_string      = regex.compile(r"^\s*((?:[^$\"'[\]{}]+?|\$\$.|\$?(?:\{(?:(?1))+\}|\[(?:(?1))+\])|\"[^\"]*\"|'[^']*')*?)\s*$")
+regex_capture_key           = regex.compile(r"^\$\w+$")
+regex_instring_expansions   = regex.compile(r"\$\{(:?(?3))(?::([^}]*))?\}(?:$^((?>[^:$\"'[\]{}]+|\$?\{(?:(?3)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)')*))?")
+regex_outstring_expansions  = regex.compile(r"(?:\$\{(:?(?4))(?::([^}]*))?\}|(?<!\w)\$([:.\w][.\w]*))(?:$^((?>[^:$\"\'[\]{}]+|\$?\{(?:(?4)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|\'(?:[^\\\']|\\.)\')*))?")
+regex_path_indirections     = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$?\{(?1)\}|(?<!\w)\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)*')+)|(?<=\.)(?=\.)")
+regex_is_regex              = regex.compile(r"^(?!\*$).*[\\+*\.()\[\]{}].*$")
 
-# Strips the supplied string of unneeded whitespaces
-def intelligent_strip(string):
-    return regex_strip_string.match(string).group(1)
 
 # Value type used when doing multiplexing
 # Contains a list of individual EvaluationStacks for each individual expression
@@ -114,9 +116,6 @@ class PyamlEngine:
         # Handle the case where the current value is None
         if self.data is None:
             return raise_error(error_method, f"Cannot access key '{key}' in '{self.location}' = None")
-
-        # Convert the attribute to the value type has in yaml (e.g. a 4 would be converted to integer, while "4" is a string)
-        key = string_to_value(key)
 
         # Handle Access to Lists
         if isinstance(self.data, list):
@@ -238,35 +237,34 @@ class PyamlEngine:
         if path[0] == ".":
             path    = path[1:]
             result  = self.pop()
+            while path[0] == ".":
+                if new_result := result.pop():
+                    path    = path[1:]
+                    result  = new_result
+                else:
+                    return raise_error(error_method, f"Cannot indirect upwards from '{result.location}', as it's already the root.")
 
-        # 2. Reference to arguments?
+        # 2. Reference to global namespace?
         elif path[0] == ":":
             path    = path[1:]
-            result  = self.push_arguments()
-
-        # 3. Reference to global namespace
-        else:
             result  = self.push_root()
+
+        # 3. Reference to arguments
+        else:
+            result  = self.push_arguments()
 
         # Resolve the path key by key
         while (key := regex_path_indirections.match(path)) is not None:
 
-            # Remove the key from the front of the path
+            # Set the path to everything after this match
             path    = path[key.span()[1]:]
 
-            # Set key to its string content (with unnecessary whitespaces trimmed from both sides of the string)
-            key     = intelligent_strip(key.group())
-
-            # Handle empty matches, they indicate two subsequent dots -> go up one level
+            # If key is empty, that means, there are two dots following each other
             if key:
+                key     = self.expand(False, error_method, value=string_to_value(key.group()))
+                result  = result.indirect(key, error_method)  # Do one step of indirection
 
-                # Replace all escape occurrences
-                key = regex_escape_pattern.sub(lambda m: m.group(1), key)
-
-                # Expand potential variables in this key and do one step of indirection
-                result  = result.indirect(self.expand(False, error_method, value=key), error_method)
-
-            # Handle empty matches, they indicate two subsequent dots -> go up one level
+            # Otherwise: Handle empty matches, they indicate two subsequent dots -> go up one level
             elif new_result := result.pop():
                 result = new_result
             else:
@@ -276,13 +274,8 @@ class PyamlEngine:
             if not path:
                 break
 
-            # Is the next key referring to the arguments?
-            elif path[0] == ":":
-                path    = path[1:]
-                result  = result.push_arguments()
-
             # Handle the dot at the end (resolves to the name of the key we're in)
-            elif path == ".":
+            if path == ".":
                 if not isinstance(result.data, BatchResult):
                     result  = result.pop().push(result._path[-1])
                 else:
@@ -310,51 +303,82 @@ class PyamlEngine:
         if isinstance(value, NotSet):
             value = self.data
 
-        result = value
+        # Is the value a string? -> Expand expansion groups in string
+        if isinstance(value, str):
 
-        # Is the value a string? -> Expand variables in string
-        if isinstance(result, str):
+            # Determine, whether inside a string or not
+            string_mode         = False
+            if isinstance(value, DoubleQuotedScalarString):
+                string_mode     = True
+            elif value[0] in ["'", '"'] and value[-1] in ["'", '"']:
+                string_mode     = True
+                value           = value[1:-1]
 
-            occurrence_is_whole_string = False
+            # Expand every expansion group
+            result              = []  # Lists of all tokens of this expressions; format: [(<value>, <is-expanded>)]
+            regex_expansions    = regex_instring_expansions if string_mode else regex_outstring_expansions
+            while (match := regex_expansions.search(value)) is not None:
 
-            # Called by regex.sub, whenever an expansion group occours
-            def expansion_group_callback(pattern):
-                nonlocal result
-                nonlocal occurrence_is_whole_string
+                # Process prefix before match
+                prefix = value[0:match.span()[0]]
+                if not string_mode:
+                    prefix = prefix.strip()
+                if prefix:
+                    result.append((prefix, False))
 
-                # Determine expansion type
-                if pattern.group().startswith("${"):
-                    result = self.resolve(pattern.group()[2:-1].lstrip()).expand(error_method)
+                # Strip the match from the input
+                value = value[match.span()[1]:]
 
-                elif pattern.group().startswith("$["):
-                    expression = self.expand(error_method, value=pattern.group()[2:-1].lstrip())
-                    try:
-                        result = eval(str(expression))
-                    except Exception as e:
-                        return raise_error(error_method, f"Error while evaluating expression '{expression}': {e}")
+                # Does the expansion have a format?
+                expression = match.group(1) or match.group(3)  # 1st group is the explicit style, 3rd group is the implicit one
+                if not expression:
+                    continue
 
-                # If this match spans the entire value, use variable "result" to return this value
-                if pattern.span() == (0, len(value)):
-                    occurrence_is_whole_string = True
-                    return ""
+                # Evaluate the expression
+                expression_result = self.resolve(expression.lstrip()).expand(error_method)
 
-                return str(result)
+                # Shall the result be formatted in a specific way?
+                if format := match.group(2):  # Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
+                    expression_result = ("{0:" + format + "}").format(expression_result)
 
-            replacement = regex_expansion_groups.sub(expansion_group_callback, result)
-            if not occurrence_is_whole_string:
-                result = replacement
+                # Add the result
+                result.append((expression_result, True))
 
+            # Process string suffix
+            if not string_mode:
+                value = value.strip()
+            if value:
+                result.append((value, False))
 
-        # Otherwise, if nested values shall be expanded, recursively call expand_value on them
-        elif expand_nested:
-            if isinstance(result, dict):
-                result = {
-                    self.push(k, k).expand(error_method, True)
-                    : self.push(v, k).expand(error_method, True)
-                    for k, v in result.items()
-                }
-            elif isinstance(result, list):
-                result = [self.push(v, i).expand(error_method, True) for i, v in enumerate(result)]
+            # Postprocess list of parts
+            if result == []:
+                result = None
+            elif string_mode:
+                result = "".join([str(v[0]) for v in result])
+            elif len(result) == 1:
+                result = result[0][0]
+            else:
+                expression = " ".join([(repr if v[1] else str)(v[0]) for v in result])
+                try:
+                    result = eval(expression)  # Evaluate the result
+                except Exception as e:
+                    return raise_error(error_method, f"Error while evaluating expression '{expression}': {e}")
+
+        # Expand on the parts of dictionaries only if nested shall be expanded
+        elif expand_nested and isinstance(value, dict):
+            result = {
+                self.push(k, k).expand(error_method, True)
+                : self.push(v, k).expand(error_method, True)
+                for k, v in value.items()
+            }
+
+        # Expand the parts of lists only if nested shall be expanded
+        elif expand_nested and isinstance(value, list):
+            result = [self.push(v, i).expand(error_method, True) for i, v in enumerate(value)]
+
+        # Otherwise, return the input
+        else:
+            result = value
 
         return result
 
@@ -400,21 +424,10 @@ def access(
     # Combine all evaluation information into one dict
     arguments   = combine_dicts(*reversed(arguments_dicts), arguments_keywords)
 
-    # 1. Expand the variables in the path
+    # 1. Resolve the path
+    engine      = PyamlEngine(dictionary, logging_name, arguments)
     try:
-        path    = PyamlEngine(path, path, arguments).expand(expand_nested=expand_nested)
-    except Exception as e:
-        error   = str(e) or f'Unknown exception "{type(e)}"'
-        error   = f'Error while expanding the path "{logging_name}.{path}": {error}'
-        return raise_error(error_method, error) or (
-            None if isinstance(fallback, NotSet) else fallback
-        )
-
-
-    # 2. Resolve the path itself
-    engine    = PyamlEngine(dictionary, logging_name, arguments).resolve(path)
-    try:
-        pass
+        engine = engine.resolve(":" + path)  # Resolve the path relative to the whole dictionary
     except Exception as e:
         if not isinstance(fallback, NotSet):
             return fallback
@@ -424,12 +437,10 @@ def access(
             None if isinstance(fallback, NotSet) else fallback
         )
 
-    # 3. Evaluate special patterns ${...} with evaluation information
-    value = engine.data
-    # try:
-    value = engine.expand(expand_nested=expand_nested)
+    # 2. Evaluate special patterns ${...} with evaluation information
+    value       = engine.data
     try:
-        pass
+        value = engine.expand(expand_nested=expand_nested)
     except Exception as e:
         error = str(e) or f'Unknown exception "{type(e)}"'
         error = f'Error while expanding value of attribute "{logging_name}.{path}": {error}'
@@ -437,7 +448,7 @@ def access(
             None if isinstance(fallback, NotSet) else fallback
         )
 
-    # 4. Check the value
+    # 3. Check the value
     if check == True and not value:
         error   = "Only non-empty values allowed!"
     elif (check == list or check == dict) and not value:
@@ -445,11 +456,11 @@ def access(
     elif callable(check) and not check(value):
         error   = f"Validation was {check}"
 
-    # 5. Return value if all checks passed
+    # 4. Return value if all checks passed
     else:
         return value
 
-    # 6. Otherwise: Determine error message
+    # 5. Otherwise: Determine error message
     if engine.data or value:
         if arguments:
             engine.data = f' = "{value}" (from {engine.data})'
@@ -459,7 +470,7 @@ def access(
         engine.data = ""
     error = f'Key value "{logging_name}".{path}{engine.data} is not valid: {error}'
 
-    # 7. Issue the error
+    # 6. Issue the error
     return raise_error(error_method, error) or (
         None if isinstance(fallback, NotSet) else fallback
     )

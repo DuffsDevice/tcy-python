@@ -7,5 +7,5 @@ with open("test2.yaml") as file:
     my_dict = yaml.load(file.read())
 
 # Example 1: Access attribute
-result = tcy.access(my_dict, "function_call.60")
+result = tcy.access(my_dict, "fac2.5")
 print("Example 1:", repr(result))

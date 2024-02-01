@@ -40,7 +40,7 @@ def raise_error(error_method, error):
 
 
 # Regular Expression Constants
-regex_capture_key           = regex.compile(r"^\$\w+$")
+regex_capture_key           = regex.compile(r"^\$\w*$")
 regex_instring_expansions   = regex.compile(r"\$\{(:?(?3))(?::([^}]*))?\}(?:$^((?>[^:$\"'[\]{}]+|\$?\{(?:(?3)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)')*))?")
 regex_outstring_expansions  = regex.compile(r"(?:\$\{(:?(?4))(?::([^}]*))?\}|(?<!\w)\$([:.\w][.\w]*))(?:$^((?>[^:$\"\'[\]{}]+|\$?\{(?:(?4)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|\'(?:[^\\\']|\\.)\')*))?")
 regex_path_indirections     = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$?\{((?1)|[:.])+\}|(?<!\w)\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)*')+)|(?<=\.)(?=\.)")
@@ -131,56 +131,51 @@ class Resolution:
         result                  = Resolution(self._root, self._name)
         result._accumulator     = self._accumulator
         if isinstance(self.data, BatchResult):
-            result._accumulator[-1] = [accumulator.finalize().data for accumulator in self.data.accumulators]
+            result._accumulator[-1] = [engine.finalize().data for engine in self.data.engines]
         result._location_stack  = self._location_stack
         result._arguments       = self._arguments
         return result
 
     # Accesses "attribute"
-    def indirect(self, key, error_method=Exception):
+    def indirect(self, key, error_method=Exception, key_evaluation_callback=None):
 
-        original_key, key = key, key.data if isinstance(key, Resolution) else key
+        # Distinguish between normal keys and evaluated keys (i.e. of type 'Resolution')
+        key_value = key.data if isinstance(key, Resolution) else key
+
+        # Ensures, that the key has been evaluated
+        def ensure_evaluated_key():
+            nonlocal key
+            nonlocal key_value
+            nonlocal key_evaluation_callback
+            if key_evaluation_callback:
+                key                     = key_evaluation_callback(key)
+                key_value               = key.data if isinstance(key, Resolution) else key
+                key_evaluation_callback = None
+                return True
+            return False
 
         # Handle the case where the current value is None
         if self.data is None:
-            return raise_error(error_method, f"Cannot access key '{key}' in '{self.location}' = None")
+            return raise_error(error_method, f"Cannot access key '{key_value}' in '{self.location}' = None")
 
         # If the current value is a resolution itself, continue inside this resolution
         elif isinstance(self.data, Resolution):
-            return self.call(self.data).indirect(key, error_method)
+            return self.call(self.data).indirect(key, error_method, key_evaluation_callback)
 
         # Handle access to dicts
         elif isinstance(self.data, dict):
 
             # A simple asterisk gives you all values regardless of key
-            if key == "*":
+            if key == "*":  # Asterisk only works on literal "*", not expanded strings equal to "*"
                 return self.push(
-                    BatchResult([
-                        self.push(v, k, {"__key": k})
-                        for k, v in self.data.items()
-                    ])
-                    , key
+                    BatchResult([self.push(v, k) for k, v in self.data.items()])
+                    , key_value
                 )
 
-            # Using a regular expression
-            elif isinstance(key, str) and regex_is_regex.match(key):
-                try:
-                    key_regex       = regex.compile(key)
-                    return self.push(
-                        BatchResult([
-                            self.push(v, k, match.groupdict() or dict(enumerate(match.groups())))
-                            for k, v in self.data.items()
-                            if (match := key_regex.match(k))
-                        ])
-                        , key
-                    )
-                except Exception as e:
-                    return raise_error(error_method, f"Key '{key}' is not a valid regular expression: {e}")
-
             # Check if the key is in the dictionary
-            if isinstance(key, typing.Hashable):
-                if key in self.data:
-                    return self.push(self.data[key], key)
+            if isinstance(key_value, typing.Hashable):
+                if key_value in self.data:
+                    return self.push(self.data[key_value], key_value)
 
             # Test for capture keys
             capture_keys = [
@@ -188,39 +183,71 @@ class Resolution:
                 for k in self.data.keys()
                 if isinstance(k, str) and (match := regex_capture_key.match(k))
             ]
+
+            # Shortcut: Only one capture key and that ones is even unnamed/discarded
+            if len(capture_keys) == 1:
+                if len(capture_keys[0]) == 1:  # Handle the case where the user just supplies a dollar in order to discard the argument
+                    return self.push(self.data[capture_keys[0]], capture_keys[0])
+
+            # Can we evaluate the key?
+            if ensure_evaluated_key():
+                # Maybe now, check again if the key is in the dictionary
+                if isinstance(key_value, typing.Hashable):
+                    if key_value in self.data:
+                        return self.push(self.data[key_value], key_value)
+
+            # Check if the access uses a regular expression
+            if isinstance(key, str) and regex_is_regex.match(key_value):
+                try:
+                    key_regex       = regex.compile(key_value)
+                    return self.push(
+                        BatchResult([
+                            self.push(v, k, match.groupdict() or dict(enumerate(match.groups())))
+                            for k, v in self.data.items()
+                            if (match := key_regex.match(k))
+                        ])
+                        , key_value
+                    )
+                except Exception as e:
+                    return raise_error(error_method, f"Key '{key_value}' is not a valid regular expression: {e}")
+
+            # Handle every other case
             if len(capture_keys) == 0:
-                return raise_error(error_method, f"No key '{key}' found in dictionary '{self.location}'")
+                return raise_error(error_method, f"No key '{key_value}' found in dictionary '{self.location}'")
             elif len(capture_keys) > 1:
                 return raise_error(
                     error_method
                     , f"More than one capture key in '{self.location}' ('"
                     + "', '".join(capture_keys)
                     + "')")
-            elif isinstance(original_key, Resolution):
-                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: original_key.reference_at(self, capture_keys[0])})
+            elif isinstance(key, Resolution):
+                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: key.reference_at(self, capture_keys[0])})
             else:
-                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: self.push(original_key, capture_keys[0])})
+                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: self.push(key, capture_keys[0])})
+
+        # From this point on, fully evaluate the key
+        ensure_evaluated_key()
 
         # Handle Access to Lists
         if isinstance(self.data, list):
 
             # Accessing an index with an integer yields the element
-            if isinstance(key, int):
-                if 0 <= key < len(self.data) or 0 > key >= -len(self.data):
-                    value = self.data[key]
+            if isinstance(key_value, int):
+                if 0 <= key_value < len(self.data) or 0 > key_value >= -len(self.data):
+                    value = self.data[key_value]
                     if isinstance(value, Resolution):
                         return value
-                    return self.push(value, key)
-                return raise_error(error_method, f"Index '{key}' is out of range for list '{self.location}'.")
+                    return self.push(value, key_value)
+                return raise_error(error_method, f"Index '{key_value}' is out of range for list '{self.location}'.")
 
             # A simple asterisk turns the list into a batch result
-            elif key == "*":
+            elif key_value == "*":
                 return self.push(
                     BatchResult([
                         self.push(v, i, {"__index": i})
                         for i, v in enumerate(self.data)
                     ])
-                    , key
+                    , key_value
                 )
 
             # Accessing the list otherwise does multiplexing and returns a list of return values
@@ -229,9 +256,9 @@ class Resolution:
                     BatchResult([
                         result
                         for i, v in enumerate(self.data)
-                        if (result := self.push(v, i, {"__index": i}).indirect(key, None))
+                        if (result := self.push(v, i, {"__index": i}).indirect(key_value, None))
                     ])
-                    , key
+                    , key_value
                 )
 
         # Handle access to batch results
@@ -239,34 +266,33 @@ class Resolution:
             return self.push(
                 BatchResult([
                     result
-                    for accumulator in self.data.accumulators
-                    if (result := accumulator.indirect(key, None))
+                    for engine in self.data.engines
+                    if (result := engine.indirect(key_value, None))
                 ])
-                , key
+                , key_value
             )
 
         # Handle access to strings
         elif isinstance(self.data, str):
             # When the key is a regular expression, try to match the accumulator with it
-            if isinstance(key, str):
+            if isinstance(key_value, str):
                 try:
-                    regular_expression = regex.compile(key)
+                    regular_expression = regex.compile(key_value)
                 except Exception as e:
-                    return raise_error(error_method, f"Key '{key}' is not a valid regular expression: {e}")
+                    return raise_error(error_method, f"Key '{key_value}' is not a valid regular expression: {e}")
                 return self.push(
                     BatchResult([
                         self.push(
                             match.groupdict() or (match.groups() if len(match.groups()) > 0 else match.group())
                             , i
-                            , {"__index": i}
                         )
                         for i, match in enumerate(regular_expression.finditer(self.data))
                     ])
-                    , key
+                    , key_value
                 )
-            return raise_error(error_method, f"Cannot access string '{self.location}' with key type '{type(key)}', expected search item")
+            return raise_error(error_method, f"Cannot access string '{self.location}' with key type '{type(key_value)}', expected search item")
 
-        return raise_error(error_method, f"Cannot access key '{key}' in '{self.location}' = '{type(self.data)}({self.data})'")
+        return raise_error(error_method, f"Cannot access key '{key_value}' in '{self.location}' = '{type(self.data)}({self.data})'")
 
 
     # Resolves the supplied path given the supplied indirection accumulator and the supplied arguments
@@ -306,9 +332,21 @@ class Resolution:
 
             # If key is empty, that means, there are two dots following each other
             if key:
-                key     = self.evaluate(False, error_method, value=string_to_value(key.group()))
-                result  = result.indirect(key, error_method)    # Do one step of indirection
-                result  = result.evaluate(error_method, full=(evaluate_fully and path == ""))         # Evaluate the result
+
+                # Callback passed to indirect in order to evaluate the key
+                def key_evaluation_callback(key):
+                    nonlocal self
+                    return self.evaluate(False, error_method, value_only=key)
+
+                # Evaluate the current value
+                result  = result.evaluate(error_method)
+
+                # So that we can do one step of indirection
+                result  = result.indirect(
+                    string_to_value(key.group())
+                    , error_method
+                    , key_evaluation_callback=key_evaluation_callback
+                )
 
             # Otherwise: Handle empty matches, they indicate two subsequent dots -> go up one level
             elif new_result := result.pop():
@@ -326,8 +364,8 @@ class Resolution:
                     result  = result.pop().push(result._path[-1])
                 else:
                     result = self.push(BatchResult([
-                        accumulator.pop().push(accumulator._path[-1])
-                        for accumulator in result.data.engines
+                        engine.pop().push(engine._path[-1])
+                        for engine in result.data.engines
                     ]))
                 break
 
@@ -338,31 +376,50 @@ class Resolution:
             else:
                 return raise_error(error_method, f"Invalid path format at '{result.location}': {path}")
 
-        # Make sure, batch results are converted to the list of results
-        return result.finalize()
+        # Make sure, we get the actual definition of the value
+        result = result.finalize()
+
+        # Fully evaluate the result?
+        if evaluate_fully:
+            result = result.evaluate(error_method, full=True).finalize()
+
+        return result
 
 
     # Helper function that expands expressions of the form ${...} int the supplied value
-    def evaluate(self, error_method=Exception, full=False, value=NotSet()):
+    def evaluate(self, error_method=Exception, full=False, value_only=NotSet()):
 
         # Determine the value to be expanded (default is the current value of the accumulator)
-        if isinstance(value, NotSet):
-            value = self.data
+        value       = self.data if isinstance(value_only, NotSet) else value_only
+        value_only  = not isinstance(value_only, NotSet)
 
         # Is the value a string? -> Expand expansion groups in string
         if isinstance(value, str):
 
             # Determine, whether inside a string or not
-            string_mode         = False
+            string_mode = False
             if isinstance(value, DoubleQuotedScalarString):
-                string_mode     = True
+                string_mode = True
             elif value[0] in ["'", '"'] and value[-1] in ["'", '"']:
-                string_mode     = True
-                value           = value[1:-1]
+                string_mode = True
+                value       = value[1:-1]
+            regex_expansions = regex_instring_expansions if string_mode else regex_outstring_expansions
 
-            # Expand every expansion group
-            result              = []  # Lists of all tokens of this expressions; format: [(<value>, <is-expanded>)]
-            regex_expansions    = regex_instring_expansions if string_mode else regex_outstring_expansions
+            # Class representing a result part
+            class ResultToken:
+                def __init__(self, value:str|Resolution, verbatim:bool, expanded:bool):
+                    self.value         = value
+                    self.is_verbatim   = verbatim
+                    self.is_expanded   = expanded
+                @staticmethod
+                def verbatim(value): return ResultToken(value, True, False)
+                @staticmethod
+                def expanded(value): return ResultToken(value, False, True)
+                @staticmethod
+                def formatted(value): return ResultToken(value, True, True)
+
+            # Iterate over the string and find the expansion groups
+            result: [ResultToken]   = []  # Lists of all tokens of this expressions
             while (match := regex_expansions.search(value)) is not None:
 
                 # Process prefix before match
@@ -370,13 +427,13 @@ class Resolution:
                 if not string_mode:
                     prefix = prefix.strip()
                 if prefix:
-                    result.append((prefix, False))
+                    result.append(ResultToken.verbatim(prefix))
 
                 # Strip the match from the input
                 value = value[match.span()[1]:]
 
                 # Does the expansion have a format?
-                expression = match.group(1) or match.group(3)  # 1st group is the explicit style, 3rd group is the implicit one
+                expression = match.group(1) or match.group(3)  # Note: 1st group is the explicit style, 3rd group is the implicit one
                 if not expression:
                     continue
 
@@ -384,29 +441,52 @@ class Resolution:
                 resolution = self.resolve(expression.lstrip())
 
                 # Shall the result be formatted in a specific way?
-                if format := match.group(2):  # Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
-                    resolution = resolution.set(("{0:" + format + "}").format(resolution.data))
-
-                # Add the result
-                result.append((resolution, True))
+                if format := match.group(2):  # Note: Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
+                    resolution = ("{0:" + format + "}").format(
+                        resolution.evaluate(error_method, full=True).data  # Prior to formatting, evaluate the value
+                    )
+                    result.append(ResultToken.formatted(resolution))
+                else:
+                    # Add the result
+                    result.append(ResultToken.expanded(resolution))
 
             # Process string suffix
             if not string_mode:
                 value = value.strip()
             if value:
-                result.append((value, False))
+                result.append(ResultToken.verbatim(value))
 
             # Postprocess list of parts
             if result == []:
                 return self.set(None)
             elif string_mode:
-                return self.set("".join([(str(v[0].data) if v[1] else v[0]) for v in result]))
+                result = "".join([
+                    v.value
+                    if v.is_verbatim else
+                    str(v.value.evaluate(error_method, full=True).data)
+                    for v in result
+                ])
+                return result if value_only else self.set(result)
             elif len(result) == 1:
-                return result[0][0] if result[0][1] else self.set(result[0][0])
+                if result[0].is_verbatim:
+                    if value_only and not result[0].is_expanded:
+                        return result[0].value
+                    else:
+                        return self.set(result[0].value)
+                elif full:
+                    return result[0].value.evaluate(error_method)
+                else:
+                    return result[0].value
             else:
-                expression = " ".join([(repr(v[0].data) if v[1] else v[0]) for v in result])
+                # Convert all result tokens into python expression
+                expression = " ".join([
+                    v.value
+                    if v.is_verbatim else
+                    repr(v.value.evaluate(error_method, full=True).data)
+                    for v in result
+                ])
                 try:
-                    return self.set(eval(expression))  # Evaluate the result
+                    return self.set(eval(expression))  # Evaluate the expression
                 except Exception as e:
                     return raise_error(error_method, f"Error while evaluating expression '{expression}': {e}")
 
@@ -422,7 +502,7 @@ class Resolution:
         elif full and isinstance(value, list):
             return self.set([self.push(v, i).evaluate(error_method, True) for i, v in enumerate(value)])
 
-        return self.set(value)
+        return value if value_only else self.set(value)
 
 
 def access(
@@ -468,8 +548,8 @@ def access(
 
     # 1. Resolve the path
     value = None
-    try:
-        value = Resolution(
+    # try:
+    value = Resolution(
             dictionary
             , logging_name
             , arguments
@@ -477,6 +557,8 @@ def access(
                 ":" + path  # Resolve the path relative to the root of the dicitonary
                 , evaluate_fully=evaluate_fully
             ).data
+    try:
+        pass
     except Exception as e:
         if not isinstance(fallback, NotSet):
             return fallback

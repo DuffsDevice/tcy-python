@@ -14,14 +14,14 @@ do:
     $wert:
       ${func.$wert}
 
-function_call: ${:append._index}
+function_call: ${:do.${:append._index}}
 
 if:
   True:
     $v:
-      $_: $v
+      $: $v
   False:
-    $_:
+    $:
       $v: $v
 
 # Definition of fac.n
@@ -29,5 +29,5 @@ fac:
   1:  1
   $n: $n * ${.$n-1}
 
-test:
-  $n: ${:if.$n==3.42.100}
+fac2:
+  $n: ${:if.$n==1.$n.$n*${.$n-1}}

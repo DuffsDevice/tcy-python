@@ -270,7 +270,7 @@ class Resolution:
 
 
     # Resolves the supplied path given the supplied indirection accumulator and the supplied arguments
-    def resolve(self, path:str, error_method=Exception):
+    def resolve(self, path:str, error_method=Exception, evaluate_fully=False):
 
         # Check origin of reference...
 
@@ -307,7 +307,8 @@ class Resolution:
             # If key is empty, that means, there are two dots following each other
             if key:
                 key     = self.evaluate(False, error_method, value=string_to_value(key.group()))
-                result  = result.indirect(key, error_method)  # Do one step of indirection
+                result  = result.indirect(key, error_method)    # Do one step of indirection
+                result  = result.evaluate(error_method, full=(evaluate_fully and path == ""))         # Evaluate the result
 
             # Otherwise: Handle empty matches, they indicate two subsequent dots -> go up one level
             elif new_result := result.pop():
@@ -342,7 +343,7 @@ class Resolution:
 
 
     # Helper function that expands expressions of the form ${...} int the supplied value
-    def evaluate(self, error_method=Exception, expand_nested=False, value=NotSet()):
+    def evaluate(self, error_method=Exception, full=False, value=NotSet()):
 
         # Determine the value to be expanded (default is the current value of the accumulator)
         if isinstance(value, NotSet):
@@ -379,8 +380,8 @@ class Resolution:
                 if not expression:
                     continue
 
-                # Evaluate the expression
-                resolution = self.resolve(expression.lstrip()).evaluate(error_method)
+                # Resolve the expression
+                resolution = self.resolve(expression.lstrip())
 
                 # Shall the result be formatted in a specific way?
                 if format := match.group(2):  # Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
@@ -410,7 +411,7 @@ class Resolution:
                     return raise_error(error_method, f"Error while evaluating expression '{expression}': {e}")
 
         # Expand on the parts of dictionaries only if nested shall be expanded
-        elif expand_nested and isinstance(value, dict):
+        elif full and isinstance(value, dict):
             return self.set({
                 self.push(k, k).evaluate(error_method, True)
                 : self.push(v, k).evaluate(error_method, True)
@@ -418,7 +419,7 @@ class Resolution:
             })
 
         # Expand the parts of lists only if nested shall be expanded
-        elif expand_nested and isinstance(value, list):
+        elif full and isinstance(value, list):
             return self.set([self.push(v, i).evaluate(error_method, True) for i, v in enumerate(value)])
 
         return self.set(value)
@@ -430,7 +431,7 @@ def access(
     , *arguments_dicts
     , fallback=NotSet()
     , check=None
-    , expand_nested: bool=True
+    , evaluate_fully: bool=True
     , error_method=Exception
     , logging_name: str="dictionary"
     , **arguments_keywords
@@ -452,7 +453,7 @@ def access(
                                  - list: Assert the value evaluates to a non-empty list
                                  - dict: Assert the value evaluates to a non-empty dictionary
                                  - <something callable>: Pass your own assertion predicate (must return bool)
-    :param expand_nested:       If the value that is queried is itself a dictionary or list:
+    :param evaluate_fully:       If the value that is queried is itself a dictionary or list:
                                 Whether to expand the contents/elements of the dictionary/list
     :param error_method:        Function to be used to signal assertion errors.
                                 You may pass "Exception" or an Exception-derived class
@@ -466,25 +467,21 @@ def access(
     arguments   = combine_dicts(*reversed(arguments_dicts), arguments_keywords)
 
     # 1. Resolve the path
-    engine      = Resolution(dictionary, logging_name, arguments)
+    value = None
     try:
-        engine = engine.resolve(":" + path)  # Resolve the path relative to the whole dictionary
+        value = Resolution(
+            dictionary
+            , logging_name
+            , arguments
+            ).resolve(
+                ":" + path  # Resolve the path relative to the root of the dicitonary
+                , evaluate_fully=evaluate_fully
+            ).data
     except Exception as e:
         if not isinstance(fallback, NotSet):
             return fallback
         error = str(e) or f'Unknown exception "{type(e)}"'
         error = f'Could not resolve attribute "{path}" in {logging_name}: {error}'
-        return raise_error(error_method, error) or (
-            None if isinstance(fallback, NotSet) else fallback
-        )
-
-    # 2. Evaluate special patterns ${...} with evaluation information
-    value       = engine.data
-    try:
-        value   = engine.evaluate(expand_nested=expand_nested).data
-    except Exception as e:
-        error = str(e) or f'Unknown exception "{type(e)}"'
-        error = f'Error while expanding value of attribute "{logging_name}.{path}": {error}'
         return raise_error(error_method, error) or (
             None if isinstance(fallback, NotSet) else fallback
         )
@@ -501,17 +498,8 @@ def access(
     else:
         return value
 
-    # 5. Otherwise: Determine error message
-    if engine.data or value:
-        if arguments:
-            engine.data = f' = "{value}" (from {engine.data})'
-        else:
-            engine.data = f' = "{engine.data}"'
-    else:
-        engine.data = ""
-    error = f'Key value "{logging_name}".{path}{engine.data} is not valid: {error}'
-
-    # 6. Issue the error
+    # 5. Issue an error
+    error = f'Key value "{logging_name}".{path} = "{value}" is not valid: {error}'
     return raise_error(error_method, error) or (
         None if isinstance(fallback, NotSet) else fallback
     )

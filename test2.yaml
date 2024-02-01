@@ -14,7 +14,7 @@ do:
     $wert:
       ${func.$wert}
 
-function_call: ${:do.${:append."_index"}.194}
+function_call: ${:append._index}
 
 if:
   True:

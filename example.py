@@ -1,5 +1,4 @@
 import tcy
-from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 from ruamel.yaml import YAML
 
 yaml = YAML()

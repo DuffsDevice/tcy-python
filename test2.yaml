@@ -1,0 +1,33 @@
+my_variable_test:
+  key_1:
+    - 42
+  key_2:
+    - 100
+
+append:
+  $suffix:
+    $value:
+      "${value}${suffix}"
+
+do:
+  $func:
+    $wert:
+      ${func.$wert}
+
+function_call: ${:do.${:append."_index"}.194}
+
+if:
+  True:
+    $v:
+      $_: $v
+  False:
+    $_:
+      $v: $v
+
+# Definition of fac.n
+fac:
+  1:  1
+  $n: $n * ${.$n-1}
+
+test:
+  $n: ${:if.$n==3.42.100}

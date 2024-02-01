@@ -1,6 +1,7 @@
 import functools
 import regex
 import inspect
+import typing
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 from ruamel.yaml import YAML
 
@@ -42,138 +43,114 @@ def raise_error(error_method, error):
 regex_capture_key           = regex.compile(r"^\$\w+$")
 regex_instring_expansions   = regex.compile(r"\$\{(:?(?3))(?::([^}]*))?\}(?:$^((?>[^:$\"'[\]{}]+|\$?\{(?:(?3)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)')*))?")
 regex_outstring_expansions  = regex.compile(r"(?:\$\{(:?(?4))(?::([^}]*))?\}|(?<!\w)\$([:.\w][.\w]*))(?:$^((?>[^:$\"\'[\]{}]+|\$?\{(?:(?4)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|\'(?:[^\\\']|\\.)\')*))?")
-regex_path_indirections     = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$?\{(?1)\}|(?<!\w)\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)*')+)|(?<=\.)(?=\.)")
+regex_path_indirections     = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$?\{((?1)|[:.])+\}|(?<!\w)\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)*')+)|(?<=\.)(?=\.)")
 regex_is_regex              = regex.compile(r"^(?!\*$).*[\\+*\.()\[\]{}].*$")
 
 
 # Value type used when doing multiplexing
 # Contains a list of individual EvaluationStacks for each individual expression
 class BatchResult:
-    def __init__(self, accumulators) -> None:
-        self.accumulators = accumulators
+    def __init__(self, engines) -> None:
+        self.engines = engines
     @property
     def results(self):
-        return [v.data for v in self.accumulators]
+        return [v.data for v in self.engines]
 
 
 # Class to keep track of all evaluations happening.
 # Note: _accumulator is a list, whose last value is the one all processing is made with
-class PyamlEngine:
-    def __init__(self, data = NotSet(), location: str = "dictionary", arguments: dict = {}):
-        self._accumulator   = None if isinstance(data, NotSet) else [data]
-        self._path          = None if isinstance(data, NotSet) else [location]
-        self._arguments     = None if isinstance(data, NotSet) else [arguments]
+class Resolution:
+    def __init__(self, root: dict = {}, name: str = "dictionary", arguments: dict = {}):
+        self._name              = name
+        self._root              = root
+        self._accumulator       = []
+        self._location_stack    = []
+        self._arguments         = [arguments] if arguments else []
     @property
     def data(self):
         return self._accumulator[-1] if self._accumulator else None
     @property
     def location(self):
-        return ".".join([str(v) for v in self._path])
+        return ".".join([str(v) for v in self._location_stack[-1]])
+    @property
+    def location_stack(self):
+        return [".".join([str(v) for v in location]) for location in self._location_stack]
     @property
     def arguments(self):
         return combine_dicts(*self._arguments)
     def push(self, value, added_location="?", *new_arguments, **new_keyword_arguments):
-        result = PyamlEngine(None, None)
-        result._accumulator = [*self._accumulator, value]
-        result._path        = [*self._path, added_location]
-        result._arguments   = [*self._arguments, combine_dicts(*new_arguments, new_keyword_arguments)]
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = [*self._accumulator, value]
+        result._location_stack  = [*self._location_stack[:-1], [*self._location_stack[-1], added_location]]
+        result._arguments       = [*self._arguments, combine_dicts(*new_arguments, new_keyword_arguments)]
+        return result
+    def set(self, value):
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = [*self._accumulator[:-1], value]
+        result._location_stack  = self._location_stack
+        result._arguments       = self._arguments
+        return result
+    def call(self, resolution):
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = [*self._accumulator, resolution.data]
+        result._location_stack  = [*self._location_stack, resolution._location_stack[-1]]
+        result._arguments       = [*self._arguments, resolution.arguments]
+        return result
+    def reference_at(self, other_resolution, added_location = None):
+        added_location = [added_location] if added_location else []
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = self._accumulator
+        result._location_stack  = [*self._location_stack, [*other_resolution._location_stack[-1], added_location]]
+        result._arguments       = self._arguments
         return result
     def pop(self):
         if len(self._accumulator) == 0:
             return None
-        result              = PyamlEngine(None, None)
-        result._accumulator = self._accumulator[0:-1]
-        result._path        = self._path[0:-1]
-        result._arguments   = self._arguments[0:-1]
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = self._accumulator[:-1]
+        result._location_stack  = [self._location_stack[:-1], self._location_stack[-1][:-1]]
+        result._arguments       = self._arguments[:-1]
         return result
-    def push_root(self):
-        result              = PyamlEngine(None, None)
-        result._accumulator = self._accumulator[0:1]
-        result._path        = self._path[0:1]
-        result._arguments   = self._arguments
+    def call_root(self):
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = [self._root]
+        result._location_stack  = [*self._location_stack, [self._name]]
+        result._arguments       = self._arguments
         return result
-    def push_arguments(self):
-        result              = PyamlEngine(None, None)
-        result._accumulator = [self.arguments] # Use the combined dictionary
-        result._path        = self._path
-        result._arguments   = self._arguments
+    def call_arguments(self):
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = [self.arguments] # Use the combined dictionary
+        result._location_stack  = [*self._location_stack, ["<arguments>"]]
+        result._arguments       = self._arguments
         return result
 
     # Converts batch results to the list of results
     def finalize(self):
-        result              = PyamlEngine(None, None)
-        result._accumulator = self._accumulator
-        if isinstance(result._accumulator[-1], BatchResult):
+        if isinstance(self.data, Resolution):
+            return self.data.finalize()
+        result                  = Resolution(self._root, self._name)
+        result._accumulator     = self._accumulator
+        if isinstance(self.data, BatchResult):
             result._accumulator[-1] = [accumulator.finalize().data for accumulator in self.data.accumulators]
-        result._path        = self._path
-        result._arguments   = self._arguments
+        result._location_stack  = self._location_stack
+        result._arguments       = self._arguments
         return result
-
 
     # Accesses "attribute"
     def indirect(self, key, error_method=Exception):
+
+        original_key, key = key, key.data if isinstance(key, Resolution) else key
 
         # Handle the case where the current value is None
         if self.data is None:
             return raise_error(error_method, f"Cannot access key '{key}' in '{self.location}' = None")
 
-        # Handle Access to Lists
-        if isinstance(self.data, list):
-
-            # Accessing an index with an integer yields the element
-            if isinstance(key, int):
-                if 0 <= key < len(self.data):
-                    value = self.data[key]
-                    if isinstance(value, PyamlEngine):
-                        return value
-                    return self.push(value, key)
-                return raise_error(error_method, f"Index '{key}' is out of range for list '{self.location}'.")
-
-            # Accessing the list otherwise does multiplexing and returns a list of return values
-            else:
-                return self.push(
-                    BatchResult([
-                        result
-                        for i, v in enumerate(self.data)
-                        if (result := self.push(v, i).indirect(key, None))
-                    ])
-                    , key
-                )
-
-        # Handle access to batch results
-        if isinstance(self.data, BatchResult):
-            return self.push(
-                BatchResult([
-                    result
-                    for accumulator in self.data.accumulators
-                    if (result := accumulator.indirect(key, None))
-                ])
-                , key
-            )
-
-        # Handle access to strings
-        if isinstance(self.data, str):
-            # When the key is a regular expression, try to match the accumulator with it
-            if isinstance(key, str):
-                try:
-                    regular_expression = regex.compile(key)
-                except Exception as e:
-                    return raise_error(error_method, f"Key '{key}' is not a valid regular expression: {e}")
-                return self.push(
-                    BatchResult([
-                        self.push(
-                            match.groupdict() or (match.groups() if len(match.groups()) > 0 else match.group())
-                            , i
-                            , {"__index": i}
-                        )
-                        for i, match in enumerate(regular_expression.finditer(self.data))
-                    ])
-                    , key
-                )
-            return raise_error(error_method, f"Cannot access string '{self.location}' with key type '{type(key)}', expected search item")
+        # If the current value is a resolution itself, continue inside this resolution
+        elif isinstance(self.data, Resolution):
+            return self.call(self.data).indirect(key, error_method)
 
         # Handle access to dicts
-        if isinstance(self.data, dict):
+        elif isinstance(self.data, dict):
 
             # A simple asterisk gives you all values regardless of key
             if key == "*":
@@ -200,8 +177,10 @@ class PyamlEngine:
                 except Exception as e:
                     return raise_error(error_method, f"Key '{key}' is not a valid regular expression: {e}")
 
-            if key in self.data:
-                return self.push(self.data[key], key)
+            # Check if the key is in the dictionary
+            if isinstance(key, typing.Hashable):
+                if key in self.data:
+                    return self.push(self.data[key], key)
 
             # Test for capture keys
             capture_keys = [
@@ -217,8 +196,75 @@ class PyamlEngine:
                     , f"More than one capture key in '{self.location}' ('"
                     + "', '".join(capture_keys)
                     + "')")
+            elif isinstance(original_key, Resolution):
+                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: original_key.reference_at(self, capture_keys[0])})
             else:
-                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: key})
+                return self.push(self.data[capture_keys[0]], capture_keys[0], {capture_keys[0][1:]: self.push(original_key, capture_keys[0])})
+
+        # Handle Access to Lists
+        if isinstance(self.data, list):
+
+            # Accessing an index with an integer yields the element
+            if isinstance(key, int):
+                if 0 <= key < len(self.data) or 0 > key >= -len(self.data):
+                    value = self.data[key]
+                    if isinstance(value, Resolution):
+                        return value
+                    return self.push(value, key)
+                return raise_error(error_method, f"Index '{key}' is out of range for list '{self.location}'.")
+
+            # A simple asterisk turns the list into a batch result
+            elif key == "*":
+                return self.push(
+                    BatchResult([
+                        self.push(v, i, {"__index": i})
+                        for i, v in enumerate(self.data)
+                    ])
+                    , key
+                )
+
+            # Accessing the list otherwise does multiplexing and returns a list of return values
+            else:
+                return self.push(
+                    BatchResult([
+                        result
+                        for i, v in enumerate(self.data)
+                        if (result := self.push(v, i, {"__index": i}).indirect(key, None))
+                    ])
+                    , key
+                )
+
+        # Handle access to batch results
+        elif isinstance(self.data, BatchResult):
+            return self.push(
+                BatchResult([
+                    result
+                    for accumulator in self.data.accumulators
+                    if (result := accumulator.indirect(key, None))
+                ])
+                , key
+            )
+
+        # Handle access to strings
+        elif isinstance(self.data, str):
+            # When the key is a regular expression, try to match the accumulator with it
+            if isinstance(key, str):
+                try:
+                    regular_expression = regex.compile(key)
+                except Exception as e:
+                    return raise_error(error_method, f"Key '{key}' is not a valid regular expression: {e}")
+                return self.push(
+                    BatchResult([
+                        self.push(
+                            match.groupdict() or (match.groups() if len(match.groups()) > 0 else match.group())
+                            , i
+                            , {"__index": i}
+                        )
+                        for i, match in enumerate(regular_expression.finditer(self.data))
+                    ])
+                    , key
+                )
+            return raise_error(error_method, f"Cannot access string '{self.location}' with key type '{type(key)}', expected search item")
 
         return raise_error(error_method, f"Cannot access key '{key}' in '{self.location}' = '{type(self.data)}({self.data})'")
 
@@ -230,8 +276,7 @@ class PyamlEngine:
 
         # The name of the current section?
         if path == ".":
-            return self.push(self._path[-1], "__key")
-
+            return self.push(self._location_stack[-1], "__key")
 
         # 1. Reference relative to parent
         if path[0] == ".":
@@ -247,11 +292,11 @@ class PyamlEngine:
         # 2. Reference to global namespace?
         elif path[0] == ":":
             path    = path[1:]
-            result  = self.push_root()
+            result  = self.call_root()
 
         # 3. Reference to arguments
         else:
-            result  = self.push_arguments()
+            result  = self.call_arguments()
 
         # Resolve the path key by key
         while (key := regex_path_indirections.match(path)) is not None:
@@ -261,7 +306,7 @@ class PyamlEngine:
 
             # If key is empty, that means, there are two dots following each other
             if key:
-                key     = self.expand(False, error_method, value=string_to_value(key.group()))
+                key     = self.evaluate(False, error_method, value=string_to_value(key.group()))
                 result  = result.indirect(key, error_method)  # Do one step of indirection
 
             # Otherwise: Handle empty matches, they indicate two subsequent dots -> go up one level
@@ -281,7 +326,7 @@ class PyamlEngine:
                 else:
                     result = self.push(BatchResult([
                         accumulator.pop().push(accumulator._path[-1])
-                        for accumulator in result.data.accumulators
+                        for accumulator in result.data.engines
                     ]))
                 break
 
@@ -297,7 +342,7 @@ class PyamlEngine:
 
 
     # Helper function that expands expressions of the form ${...} int the supplied value
-    def expand(self, error_method=Exception, expand_nested=False, value=NotSet()):
+    def evaluate(self, error_method=Exception, expand_nested=False, value=NotSet()):
 
         # Determine the value to be expanded (default is the current value of the accumulator)
         if isinstance(value, NotSet):
@@ -335,14 +380,14 @@ class PyamlEngine:
                     continue
 
                 # Evaluate the expression
-                expression_result = self.resolve(expression.lstrip()).expand(error_method)
+                resolution = self.resolve(expression.lstrip()).evaluate(error_method)
 
                 # Shall the result be formatted in a specific way?
                 if format := match.group(2):  # Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
-                    expression_result = ("{0:" + format + "}").format(expression_result)
+                    resolution = resolution.set(("{0:" + format + "}").format(resolution.data))
 
                 # Add the result
-                result.append((expression_result, True))
+                result.append((resolution, True))
 
             # Process string suffix
             if not string_mode:
@@ -352,35 +397,31 @@ class PyamlEngine:
 
             # Postprocess list of parts
             if result == []:
-                result = None
+                return self.set(None)
             elif string_mode:
-                result = "".join([str(v[0]) for v in result])
+                return self.set("".join([(str(v[0].data) if v[1] else v[0]) for v in result]))
             elif len(result) == 1:
-                result = result[0][0]
+                return result[0][0] if result[0][1] else self.set(result[0][0])
             else:
-                expression = " ".join([(repr if v[1] else str)(v[0]) for v in result])
+                expression = " ".join([(repr(v[0].data) if v[1] else v[0]) for v in result])
                 try:
-                    result = eval(expression)  # Evaluate the result
+                    return self.set(eval(expression))  # Evaluate the result
                 except Exception as e:
                     return raise_error(error_method, f"Error while evaluating expression '{expression}': {e}")
 
         # Expand on the parts of dictionaries only if nested shall be expanded
         elif expand_nested and isinstance(value, dict):
-            result = {
-                self.push(k, k).expand(error_method, True)
-                : self.push(v, k).expand(error_method, True)
+            return self.set({
+                self.push(k, k).evaluate(error_method, True)
+                : self.push(v, k).evaluate(error_method, True)
                 for k, v in value.items()
-            }
+            })
 
         # Expand the parts of lists only if nested shall be expanded
         elif expand_nested and isinstance(value, list):
-            result = [self.push(v, i).expand(error_method, True) for i, v in enumerate(value)]
+            return self.set([self.push(v, i).evaluate(error_method, True) for i, v in enumerate(value)])
 
-        # Otherwise, return the input
-        else:
-            result = value
-
-        return result
+        return self.set(value)
 
 
 def access(
@@ -425,7 +466,7 @@ def access(
     arguments   = combine_dicts(*reversed(arguments_dicts), arguments_keywords)
 
     # 1. Resolve the path
-    engine      = PyamlEngine(dictionary, logging_name, arguments)
+    engine      = Resolution(dictionary, logging_name, arguments)
     try:
         engine = engine.resolve(":" + path)  # Resolve the path relative to the whole dictionary
     except Exception as e:
@@ -440,7 +481,7 @@ def access(
     # 2. Evaluate special patterns ${...} with evaluation information
     value       = engine.data
     try:
-        value = engine.expand(expand_nested=expand_nested)
+        value   = engine.evaluate(expand_nested=expand_nested).data
     except Exception as e:
         error = str(e) or f'Unknown exception "{type(e)}"'
         error = f'Error while expanding value of attribute "{logging_name}.{path}": {error}'

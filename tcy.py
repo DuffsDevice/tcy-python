@@ -41,9 +41,11 @@ def raise_error(error_method, error):
 
 # Regular Expression Constants
 regex_capture_key           = regex.compile(r"^\$\w*$")
-regex_instring_expansions   = regex.compile(r"\$\{(:?(?3))(?::([^}]*))?\}(?:$^((?>[^:$\"'[\]{}]+|\$?\{(?:(?3)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)')*))?")
-regex_outstring_expansions  = regex.compile(r"(?:\$\{(:?(?4))(?::([^}]*))?\}|(?<!\w)\$([:.\w][.\w]*))(?:$^((?>[^:$\"\'[\]{}]+|\$?\{(?:(?4)|:)+\}|\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|\'(?:[^\\\']|\\.)\')*))?")
-regex_path_indirections     = regex.compile(r"((?:[^.:$\"'[\]{}]+|\$?\{((?1)|[:.])+\}|(?<!\w)\$(?!\{)|\"(?:[^\\\"]|\\.)*\"|'(?:[^\\\']|\\.)*')+)|(?<=\.)(?=\.)")
+regex_instring_expansions   = regex.compile(r"\$\((([-\s\w.$]|(\((?:(?2)|\s)*\))|(\"(?:[^\"\\]|\\.)*\")|(\'(?:[^\'\\]|\\.)*\'))+)\)")
+regex_outstring_expansions  = regex.compile(r"\$\((\s*[-\w.:]([^()\"\']|(?&R))*)\)|\$(?=[-\w.:]|\(\s*[^-\w.:])((?&R)+)(?(DEFINE)(?<R>[-\w.:$]|\((?:[^()\"\']|(?&R))*\)|\"(?:[^\"\\]|\\.)*\"|\'(?:[^\'\\]|\\.)*\'))")
+regex_parts_in_path         = regex.compile(r"([^\s.,()\"\']|\(((?1)|[\s,.])*\)|\"(?>[^\\\"]|\\.)*\"|'(?>[^\\\']|\\.)*')+|(?<=\.)\s*(?=\.)|\(\)")
+regex_calls_in_part         = regex.compile(r"(?<=[^\s])\s*\(([^()\"\']|\((?1)*\)|\"(?>[^\\\"]|\\.)*\"|'(?>[^\\\']|\\.)*')*\)\s*$")
+regex_arguments_in_call     = regex.compile(r"(?>[^,()\"\']|\((?>(?R)|[,\s])*\)|\"(?>[^\\\"]|\\.)*\"|'(?>[^\\\']|\\.)*')+|(?<=,|^])(?=\s*(?:,|$))")
 regex_is_regex              = regex.compile(r"^(?!\*$).*[\\+*\.()\[\]{}].*$")
 
 
@@ -302,13 +304,29 @@ class Resolution:
 
         # The name of the current section?
         if path == ".":
-            return self.push(self._location_stack[-1], "__key")
+            return self.pop()
+
+        # Convert function-style calls to path parts
+        path = regex_parts_in_path.sub(
+            lambda part:
+                regex_calls_in_part.sub(
+                    lambda call:
+                        ".("
+                        + ").(".join([
+                        arg.strip() or "null"
+                        for arg in regex_arguments_in_call.findall(call.group().strip()[1:-1])
+                        ])
+                        +")"
+                    , part.group()
+                )
+            , path
+        )
 
         # 1. Reference relative to parent
-        if path[0] == ".":
+        if path.startswith("."):
             path    = path[1:]
             result  = self.pop()
-            while path[0] == ".":
+            while path.startswith("."):
                 if new_result := result.pop():
                     path    = path[1:]
                     result  = new_result
@@ -316,7 +334,7 @@ class Resolution:
                     return raise_error(error_method, f"Cannot indirect upwards from '{result.location}', as it's already the root.")
 
         # 2. Reference to global namespace?
-        elif path[0] == ":":
+        elif path.startswith(":"):
             path    = path[1:]
             result  = self.call_root()
 
@@ -324,28 +342,32 @@ class Resolution:
         else:
             result  = self.call_arguments()
 
-        # Resolve the path key by key
-        while (key := regex_path_indirections.match(path)) is not None:
+        # Resolve the path part by part
+        while (part := regex_parts_in_path.match(path)) is not None:
 
             # Set the path to everything after this match
-            path    = path[key.span()[1]:]
+            path    = path[part.span()[1]:]
 
             # If key is empty, that means, there are two dots following each other
-            if key:
+            if part := part.group():
+
+                # Get rid of matching parentheses
+                if part[0] == "(" and part[-1] == ")":
+                    part = part[1:-1].strip()
 
                 # Callback passed to indirect in order to evaluate the key
-                def key_evaluation_callback(key):
+                def evaluate_part(part):
                     nonlocal self
-                    return self.evaluate(False, error_method, value_only=key)
+                    return self.evaluate(False, error_method, value_only=part)
 
                 # Evaluate the current value
                 result  = result.evaluate(error_method)
 
                 # So that we can do one step of indirection
                 result  = result.indirect(
-                    string_to_value(key.group())
+                    string_to_value(part)
                     , error_method
-                    , key_evaluation_callback=key_evaluation_callback
+                    , key_evaluation_callback=evaluate_part
                 )
 
             # Otherwise: Handle empty matches, they indicate two subsequent dots -> go up one level
@@ -394,7 +416,7 @@ class Resolution:
         value_only  = not isinstance(value_only, NotSet)
 
         # Is the value a string? -> Expand expansion groups in string
-        if isinstance(value, str):
+        if isinstance(value, str) and value != "":
 
             # Determine, whether inside a string or not
             string_mode = False
@@ -430,15 +452,13 @@ class Resolution:
                     result.append(ResultToken.verbatim(prefix))
 
                 # Strip the match from the input
-                value = value[match.span()[1]:]
+                value       = value[match.span()[1]:]
 
-                # Does the expansion have a format?
-                expression = match.group(1) or match.group(3)  # Note: 1st group is the explicit style, 3rd group is the implicit one
-                if not expression:
-                    continue
+                # Determine content
+                content     = match.group(1) or match.group(3)
 
                 # Resolve the expression
-                resolution = self.resolve(expression.lstrip())
+                resolution  = self.resolve(content)
 
                 # Shall the result be formatted in a specific way?
                 if format := match.group(2):  # Note: Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
@@ -458,7 +478,7 @@ class Resolution:
 
             # Postprocess list of parts
             if result == []:
-                return self.set(None)
+                return None if value_only else self.set(None)
             elif string_mode:
                 result = "".join([
                     v.value

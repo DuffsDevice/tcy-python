@@ -12,22 +12,35 @@ append:
 do:
   $func:
     $wert:
-      ${func.$wert}
+      $(func).$wert)
 
 function_call: ${:do.${:append._index}}
-
-if:
-  True:
-    $v:
-      $: $v
-  False:
-    $:
-      $v: $v
 
 # Definition of fac.n
 fac:
   1:  1
-  $n: $n * ${.$n-1}
+  $n: $n * $.($n - 1)
+
+# Definition of if.$condition.[then.]$then.[else.]$else
+if:
+  True:
+    then: $.
+    $v:
+      else: $.
+      $: $v
+  False:
+    then: $.
+    $:
+      else: $.
+      $v: $v
+  $c: $.(bool($c))
 
 fac2:
-  $n: ${:if.$n==1.$n.$n*${.$n-1}}
+  $n:
+    $:if(
+      $n==1
+    ).then.(
+      $n
+    ).else.(
+      $n * $.($n -1)
+    )

@@ -346,7 +346,7 @@ class Resolution:
         while (part := regex_parts_in_path.match(path)) is not None:
 
             # Set the path to everything after this match
-            path    = path[part.span()[1]:]
+            path    = path[part.span()[1]:].lstrip()
 
             # If key is empty, that means, there are two dots following each other
             if part := part.group():
@@ -458,17 +458,17 @@ class Resolution:
                 content     = match.group(1) or match.group(3)
 
                 # Resolve the expression
-                resolution  = self.resolve(content)
+                resolution  = self.resolve(content.strip())
 
                 # Shall the result be formatted in a specific way?
-                if format := match.group(2):  # Note: Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
-                    resolution = ("{0:" + format + "}").format(
-                        resolution.evaluate(error_method, full=True).data  # Prior to formatting, evaluate the value
-                    )
-                    result.append(ResultToken.formatted(resolution))
-                else:
-                    # Add the result
-                    result.append(ResultToken.expanded(resolution))
+                # if format := match.group(5):  # Note: Match group 2 is defined as the formatting specifier, e.g. as in {value:03}
+                #     resolution = ("{0:" + format + "}").format(
+                #         resolution.evaluate(error_method, full=True).data  # Prior to formatting, evaluate the value
+                #     )
+                #     result.append(ResultToken.formatted(resolution))
+                # else:
+                # Add the result
+                result.append(ResultToken.expanded(resolution))
 
             # Process string suffix
             if not string_mode:

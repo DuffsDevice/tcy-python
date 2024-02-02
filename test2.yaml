@@ -24,23 +24,33 @@ fac:
 # Definition of if.$condition.[then.]$then.[else.]$else
 if:
   True:
+    and:  $..
+    or:
+      $:  $..
     then: $.
     $v:
+      elif:
+        $:  $..__skip_elif
+      then: $.
       else: $.
       $: $v
+      __skip_elif:
+        $:    $..
+        then: $.
+        elif:
+          $:  $..
+        else: $..
   False:
+    or:   $..
+    and:
+      $:  $..
     then: $.
     $:
+      elif: $:if
       else: $.
       $v: $v
   $c: $.(bool($c))
 
 fac2:
   $n:
-    $:if(
-      $n==1
-    ).then.(
-      $n
-    ).else.(
-      $n * $.($n -1)
-    )
+    $:if($n<=1).$n.($n * $.($n -1))
